@@ -1571,7 +1571,8 @@
 
          if (update_ocn_f) then
             dfresh = -rhoi*vi0new(ij)/dt
-            dfsalt = ice_ref_salinity*p001*dfresh
+            dfsalt = MIN(ice_ref_salinity,sss(i,j))*p001*dfresh
+            !dfsalt = ice_ref_salinity*p001*dfresh
 
             fresh(i,j)      = fresh(i,j)      + dfresh
             fsalt(i,j)      = fsalt(i,j)      + dfsalt
