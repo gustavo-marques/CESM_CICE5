@@ -243,12 +243,13 @@
        ! high frequency coupling follows Roberts et al. (2015)
        if (my_task==master_task.and.firstpass.and.sfctype(1:3)=='ice') then
          if (present(uice) .and. present(vice)) then
+!$OMP MASTER
           write(nu_diag,*)'Using high frequency RASM atmospheric coupling'
+!$OMP END MASTER
          else
           call abort_ice('High frequency RASM coupling missing uice and vice')
          endif
        endif
-
        umin  = p5 ! minumum allowable wind-ice speed difference of 0.5 m/s
 
       else
@@ -333,12 +334,13 @@
          j = indxj(ij)
 
          TsfK      = Tsf(i,j) + Tffresh     ! surface temp (K)
+         delt(i,j) = potT(i,j) - TsfK
+
          ! Cold Air Outbreak Modification:
          ! Increase windspeed for negative delt
          ! based on Mahrt & Sun 1995,MWR
          if (use_coldair_outbreak_mod) then
             ! Mahrt and Sun adjustment
-            delt(i,j) = potT(i,j) - TsfK
 
             if (delt(i,j).lt.td0) then
                vscl=min((c1+alpha*(abs(delt(i,j)-td0)**p5/abs(vmag(ij)))),maxscl)

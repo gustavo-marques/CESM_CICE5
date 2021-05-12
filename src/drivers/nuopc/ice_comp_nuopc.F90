@@ -15,30 +15,21 @@ module ice_comp_nuopc
   use NUOPC_Model            , only : model_label_SetRunClock    => label_SetRunClock
   use NUOPC_Model            , only : model_label_Finalize       => label_Finalize
   use NUOPC_Model            , only : NUOPC_ModelGet, SetVM
-  use shr_kind_mod           , only : r8 => shr_kind_r8, cl=>shr_kind_cl, cs=>shr_kind_cs 
-  use shr_sys_mod            , only : shr_sys_abort
+  use shr_kind_mod           , only : r8 => shr_kind_r8, cl=>shr_kind_cl, cs=>shr_kind_cs
   use shr_file_mod           , only : shr_file_getlogunit, shr_file_setlogunit
   use shr_orb_mod            , only : shr_orb_decl, shr_orb_params, SHR_ORB_UNDEF_REAL, SHR_ORB_UNDEF_INT
   use shr_cal_mod            , only : shr_cal_noleap, shr_cal_gregorian, shr_cal_ymd2date
   use ice_shr_methods        , only : chkerr, state_setscalar, state_getscalar, state_diagnose, alarmInit
-  use ice_shr_methods        , only : set_component_logging, get_component_instance
-  use ice_shr_methods        , only : state_flddebug
-  use ice_import_export      , only : ice_import, ice_export
-  use ice_import_export      , only : ice_advertise_fields, ice_realize_fields
+  use ice_shr_methods        , only : set_component_logging, get_component_instance, state_flddebug
+  use ice_import_export      , only : ice_import, ice_export, ice_advertise_fields, ice_realize_fields
   use ice_domain_size        , only : nx_global, ny_global
-  use ice_domain             , only : nblocks, blocks_ice, distrb_info
-  use ice_blocks             , only : block, get_block, nx_block, ny_block, nblocks_x, nblocks_y
-  use ice_blocks             , only : nblocks_tot, get_block_parameter
-  use ice_distribution       , only : ice_distributiongetblockloc
-  use ice_grid               , only : tlon, tlat, hm, tarea, ULON, ULAT
-  use ice_constants          , only : rad_to_deg
   use ice_communicate        , only : init_communicate, my_task, master_task, mpi_comm_ice
   use ice_calendar           , only : force_restart_now, write_ic
   use ice_calendar           , only : idate, mday, time, month, daycal, time2sec, year_init
   use ice_calendar           , only : sec, dt, calendar, calendar_type, nextsw_cday, istep
   use ice_orbital            , only : eccen, obliqr, lambm0, mvelpp
   use ice_kinds_mod          , only : dbl_kind, int_kind
-  use ice_scam               , only : scmlat, scmlon, single_column
+  use ice_scam               , only : scmlat, scmlon, scol_mask, scol_frac, scol_ni, scol_nj, scol_valid, single_column
   use ice_fileunits          , only : nu_diag, inst_index, inst_name, inst_suffix, release_all_fileunits
   use ice_ocean              , only : tfrz_option
   use ice_therm_shared       , only : ktherm
@@ -48,11 +39,15 @@ module ice_comp_nuopc
   use ice_prescribed_mod     , only : ice_prescribed_init
   use ice_atmo               , only : flux_convergence_tolerance, flux_convergence_max_iteration
   use ice_atmo               , only : use_coldair_outbreak_mod
-  use CICE_InitMod           , only : CICE_Init
+  use ice_mesh_mod           , only : ice_mesh_set_distgrid, ice_mesh_setmask_from_maskfile, ice_mesh_check
+  use ice_mesh_mod           , only : ice_mesh_init_tlon_tlat_area_hm, ice_mesh_create_scolumn
+  use ice_grid               , only : init_grid2, grid_type
+  use ice_exit               , only : abort_ice
+  use CICE_InitMod           , only : CICE_Init1, CICE_Init2
   use CICE_RunMod            , only : CICE_Run
   use perf_mod               , only : t_startf, t_stopf, t_barrierf
   use ice_timers
-
+!$ use OMP_LIB               , only : omp_set_num_threads
   implicit none
 
   public  :: SetServices
@@ -73,9 +68,7 @@ module ice_comp_nuopc
   integer           :: flds_scalar_index_ny = 0
   integer           :: flds_scalar_index_nextsw_cday = 0
 
-  integer     , parameter :: dbug = 10
-  integer     , parameter :: debug_import = 0 ! internal debug level
-  integer     , parameter :: debug_export = 0 ! internal debug level
+  integer     , parameter :: dbug = 0
   character(*), parameter :: modName =  "(ice_comp_nuopc)"
   character(*), parameter :: u_FILE_u = &
        __FILE__
@@ -90,6 +83,8 @@ module ice_comp_nuopc
   character(len=*) , parameter :: orb_fixed_year       = 'fixed_year'
   character(len=*) , parameter :: orb_variable_year    = 'variable_year'
   character(len=*) , parameter :: orb_fixed_parameters = 'fixed_parameters'
+
+  integer                 :: nthrds   ! Number of threads to use in this component
 
 !=======================================================================
 contains
@@ -189,7 +184,7 @@ contains
        call ESMF_LogWrite(trim(subname)//' flds_scalar_name = '//trim(flds_scalar_name), ESMF_LOGMSG_INFO)
        if (ChkErr(rc,__LINE__,u_FILE_u)) return
     else
-       call shr_sys_abort(subname//'Need to set attribute ScalarFieldName')
+       call abort_ice(subname//'Need to set attribute ScalarFieldName')
     endif
 
     call NUOPC_CompAttributeGet(gcomp, name="ScalarFieldCount", value=cvalue, isPresent=isPresent, isSet=isSet, rc=rc)
@@ -200,7 +195,7 @@ contains
        call ESMF_LogWrite(trim(subname)//' flds_scalar_num = '//trim(logmsg), ESMF_LOGMSG_INFO)
        if (ChkErr(rc,__LINE__,u_FILE_u)) return
     else
-       call shr_sys_abort(subname//'Need to set attribute ScalarFieldCount')
+       call abort_ice(subname//'Need to set attribute ScalarFieldCount')
     endif
 
     call NUOPC_CompAttributeGet(gcomp, name="ScalarFieldIdxGridNX", value=cvalue, isPresent=isPresent, isSet=isSet, rc=rc)
@@ -211,7 +206,7 @@ contains
        call ESMF_LogWrite(trim(subname)//' : flds_scalar_index_nx = '//trim(logmsg), ESMF_LOGMSG_INFO)
        if (ChkErr(rc,__LINE__,u_FILE_u)) return
     else
-       call shr_sys_abort(subname//'Need to set attribute ScalarFieldIdxGridNX')
+       call abort_ice(subname//'Need to set attribute ScalarFieldIdxGridNX')
     endif
 
     call NUOPC_CompAttributeGet(gcomp, name="ScalarFieldIdxGridNY", value=cvalue, isPresent=isPresent, isSet=isSet, rc=rc)
@@ -222,7 +217,7 @@ contains
        call ESMF_LogWrite(trim(subname)//' : flds_scalar_index_ny = '//trim(logmsg), ESMF_LOGMSG_INFO)
        if (ChkErr(rc,__LINE__,u_FILE_u)) return
     else
-       call shr_sys_abort(subname//'Need to set attribute ScalarFieldIdxGridNY')
+       call abort_ice(subname//'Need to set attribute ScalarFieldIdxGridNY')
     endif
 
     call NUOPC_CompAttributeGet(gcomp, name="ScalarFieldIdxNextSwCday", value=cvalue, isPresent=isPresent, isSet=isSet, rc=rc)
@@ -233,7 +228,7 @@ contains
        call ESMF_LogWrite(trim(subname)//' : flds_scalar_index_nextsw_cday = '//trim(logmsg), ESMF_LOGMSG_INFO)
        if (ChkErr(rc,__LINE__,u_FILE_u)) return
     else
-       call shr_sys_abort(subname//'Need to set attribute ScalarFieldIdxNextSwCday')
+       call abort_ice(subname//'Need to set attribute ScalarFieldIdxNextSwCday')
     endif
 
     call ice_advertise_fields(gcomp, importState, exportState, flds_scalar_name, rc)
@@ -253,25 +248,17 @@ contains
     integer, intent(out) :: rc
 
     ! Local variables
-    type(ESMF_DistGrid)     :: distGrid
-    type(ESMF_Mesh)         :: mesh, meshTemp
-    integer                 :: spatialDim
-    integer                 :: numOwnedElements
-    real(R8), pointer       :: ownedElemCoords(:)
-    real(r8), pointer       :: lat(:), latMesh(:)
-    real(r8), pointer       :: lon(:), lonMesh(:)
-    integer , allocatable   :: gindex_ice(:)
-    integer , allocatable   :: gindex_elim(:)
-    integer , allocatable   :: gindex(:)
-    integer                 :: globalID
-    character(CL)           :: cvalue
+    integer                 :: lmpicom
+    integer                 :: localPet
+    integer                 :: npes
+    type(ESMF_DistGrid)     :: ice_distgrid
+    type(ESMF_Mesh)         :: ice_mesh
     type(ESMF_VM)           :: vm
     type(ESMF_Time)         :: currTime           ! Current time
     type(ESMF_Time)         :: startTime          ! Start time
     type(ESMF_Time)         :: stopTime           ! Stop time
     type(ESMF_Time)         :: refTime            ! Ref time
     type(ESMF_TimeInterval) :: timeStep           ! Model timestep
-    type(ESMF_Calendar)     :: esmf_calendar      ! esmf calendar
     type(ESMF_CalKind_Flag) :: esmf_caltype       ! esmf calendar type
     integer                 :: start_ymd          ! Start date (YYYYMMDD)
     integer                 :: start_tod          ! start time of day (s)
@@ -284,29 +271,23 @@ contains
     integer                 :: yy,mm,dd           ! Temporaries for time query
     integer                 :: iyear              ! yyyy
     integer                 :: dtime              ! time step
-    integer                 :: lmpicom
     integer                 :: shrlogunit         ! original log unit
     character(len=cs)       :: starttype          ! infodata start type
-    integer                 :: lsize              ! local size of coupling array
-    character(len=512)      :: diro
-    character(len=512)      :: logfile
     logical                 :: isPresent
-    integer                 :: localPet
-    integer                 :: n,c,g,i,j,m        ! indices
-    integer                 :: iblk, jblk         ! indices
-    integer                 :: ig, jg             ! indices
-    integer                 :: ilo, ihi, jlo, jhi ! beginning and end of physical domain
-    type(block)             :: this_block         ! block information for current block
-    real(R8)                :: diff_lon
-    integer                 :: npes
-    integer                 :: num_elim_global
-    integer                 :: num_elim_local
-    integer                 :: num_elim
-    integer                 :: num_ice
-    integer                 :: num_elim_gcells    ! local number of eliminated gridcells
-    integer                 :: num_elim_blocks    ! local number of eliminated blocks
-    integer                 :: num_total_blocks
-    integer                 :: my_elim_start, my_elim_end
+    character(CL)           :: cvalue
+    character(CL)           :: single_column_lnd_domainfile
+    character(len=CL)       :: ice_meshfile
+    character(len=CL)       :: ice_maskfile
+    type(ESMF_Field)        :: lfield
+    character(CL) ,pointer  :: lfieldnamelist(:) => null()
+    integer                 :: fieldcount
+    real(r8), pointer       :: fldptr1d(:)
+    real(r8), pointer       :: fldptr2d(:,:)
+    integer                 :: n
+    real(r8)                :: scol_lon
+    real(r8)                :: scol_lat
+    real(r8)                :: scol_spval
+    integer                 :: rank
     character(*), parameter     :: F00   = "('(ice_comp_nuopc) ',2a,1x,d21.14)"
     character(len=*), parameter :: subname=trim(modName)//':(InitializeRealize) '
     !--------------------------------
@@ -315,14 +296,105 @@ contains
     if (dbug > 5) call ESMF_LogWrite(subname//' called', ESMF_LOGMSG_INFO)
 
     !----------------------------------------------------------------------------
+    ! Single column logic - if mask is zero for nearest neighbor search then
+    ! set all export state fields to zero and return
+    !----------------------------------------------------------------------------
+
+    call NUOPC_CompAttributeGet(gcomp, name='scol_lon', value=cvalue, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    read(cvalue,*) scmlon
+    call NUOPC_CompAttributeGet(gcomp, name='scol_lat', value=cvalue, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    read(cvalue,*) scmlat
+    call NUOPC_CompAttributeGet(gcomp, name='scol_spval', value=cvalue, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    read(cvalue,*) scol_spval
+
+    if (scmlon > scol_spval .and. scmlat > scol_spval) then
+       call NUOPC_CompAttributeGet(gcomp, name='single_column_lnd_domainfile', &
+            value=single_column_lnd_domainfile, rc=rc)
+       if (ChkErr(rc,__LINE__,u_FILE_u)) return
+       if (trim(single_column_lnd_domainfile) /= 'UNSET') then
+          single_column = .true.
+       else
+          call abort_ice('single_column_domainfile cannot be null for single column mode')
+       end if
+       call NUOPC_CompAttributeGet(gcomp, name='scol_ocnmask', value=cvalue, rc=rc)
+       if (chkerr(rc,__LINE__,u_FILE_u)) return
+       read(cvalue,*) scol_mask
+       call NUOPC_CompAttributeGet(gcomp, name='scol_ocnfrac', value=cvalue, rc=rc)
+       if (chkerr(rc,__LINE__,u_FILE_u)) return
+       read(cvalue,*) scol_frac
+       call NUOPC_CompAttributeGet(gcomp, name='scol_ni', value=cvalue, rc=rc)
+       if (chkerr(rc,__LINE__,u_FILE_u)) return
+       read(cvalue,*) scol_ni
+       call NUOPC_CompAttributeGet(gcomp, name='scol_nj', value=cvalue, rc=rc)
+       if (chkerr(rc,__LINE__,u_FILE_u)) return
+       read(cvalue,*) scol_nj
+
+       call ice_mesh_create_scolumn(scmlon, scmlat, ice_mesh, rc)
+       if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+       scol_valid = (scol_mask == 1)
+       if (.not. scol_valid) then
+          ! if single column is not valid - set all export state fields to zero and return
+          write(nu_diag,'(a)')' (ice_comp_nuopc) single column mode point does not contain any ocn/ice '&
+               //' - setting all export data to 0'
+          call ice_realize_fields(importState, exportState, mesh=ice_mesh, &
+               flds_scalar_name=flds_scalar_name, flds_scalar_num=flds_scalar_num, rc=rc)
+          if (ChkErr(rc,__LINE__,u_FILE_u)) return
+          call ESMF_StateGet(exportState, itemCount=fieldCount, rc=rc)
+          if (chkerr(rc,__LINE__,u_FILE_u)) return
+          allocate(lfieldnamelist(fieldCount))
+          call ESMF_StateGet(exportState, itemNameList=lfieldnamelist, rc=rc)
+          if (chkerr(rc,__LINE__,u_FILE_u)) return
+          do n = 1, fieldCount
+             if (trim(lfieldnamelist(n)) /= flds_scalar_name) then
+                call ESMF_StateGet(exportState, itemName=trim(lfieldnamelist(n)), field=lfield, rc=rc)
+                if (chkerr(rc,__LINE__,u_FILE_u)) return
+                call ESMF_FieldGet(lfield, rank=rank, rc=rc)
+                if (chkerr(rc,__LINE__,u_FILE_u)) return
+                if (rank == 2) then
+                   call ESMF_FieldGet(lfield, farrayPtr=fldptr2d, rc=rc)
+                   if (ChkErr(rc,__LINE__,u_FILE_u)) return
+                   fldptr2d(:,:) = 0._r8
+                else
+                   call ESMF_FieldGet(lfield, farrayPtr=fldptr1d, rc=rc)
+                   if (ChkErr(rc,__LINE__,u_FILE_u)) return
+                   fldptr1d(:) = 0._r8
+                end if
+             end if
+          enddo
+          deallocate(lfieldnamelist)
+          ! *******************
+          ! *** RETURN HERE ***
+          ! *******************
+          RETURN
+       else
+          write(nu_diag,'(a,3(f10.5,2x))')' (ice_comp_nuopc) single column mode lon/lat/frac is ',&
+               scmlon,scmlat,scol_frac
+       end if
+    else
+       single_column = .false.
+    end if
+
+    !----------------------------------------------------------------------------
     ! generate local mpi comm
     !----------------------------------------------------------------------------
 
     call ESMF_GridCompGet(gcomp, vm=vm, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
-
     call ESMF_VMGet(vm, mpiCommunicator=lmpicom, localPet=localPet, PetCount=npes, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+    call ESMF_VMGet(vm, pet=localPet, peCount=nthrds, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    if(nthrds==1) then
+       call NUOPC_CompAttributeGet(gcomp, "nthreads", value=cvalue, rc=rc)
+       if (ESMF_LogFoundError(rcToCheck=rc, msg=ESMF_LOGERR_PASSTHRU, line=__LINE__, file=u_FILE_u)) return
+       read(cvalue,*) nthrds
+    endif
+!$  call omp_set_num_threads(nthrds)
 
     !----------------------------------------------------------------------------
     ! Initialize cice communicators
@@ -337,7 +409,7 @@ contains
     call get_component_instance(gcomp, inst_suffix, inst_index, rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
-    inst_name = "ICE"//trim(inst_suffix)
+    inst_name = "ICE"
 
     !----------------------------------------------------------------------------
     ! start cice timers
@@ -354,7 +426,6 @@ contains
 
     call cice_orbital_init(gcomp, nu_diag, my_task==master_task, rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
-
     call cice_orbital_update(clock, nu_diag, my_task==master_task, eccen, obliqr, lambm0, mvelpp, rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
@@ -374,7 +445,7 @@ contains
        else if (trim(starttype) == trim('branch')) then
           runtype = "continue"
        else
-          call shr_sys_abort( subname//' ERROR: unknown starttype' )
+          call abort_ice( subname//' ERROR: unknown starttype' )
        end if
 
        ! Note that in the mct version the atm was initialized first so that nextsw_cday could be passed to the other
@@ -382,7 +453,7 @@ contains
        ! In the nuopc version it will be easier to assume that on startup - nextsw_cday is just the current time
 
        ! TOOD (mvertens, 2019-03-21): need to get the perpetual run working
-     
+
        if (trim(runtype) /= 'initial') then
           ! Set nextsw_cday to -1 (this will skip an orbital calculation on initialization
           nextsw_cday = -1.0_r8
@@ -394,28 +465,10 @@ contains
        end if
     else
        ! This would be the NEMS branch
-       ! Note that in NEMS - nextsw_cday is not needed in ice_orbital.F90 and what is needed is 
+       ! Note that in NEMS - nextsw_cday is not needed in ice_orbital.F90 and what is needed is
        ! simply a CPP variable declaratino of NEMSCOUPLED
 
        runtype = 'initial' ! determined from the namelist in ice_init if CESMCOUPLED is not defined
-    end if
-
-    ! Determine single column info
-    call NUOPC_CompAttributeGet(gcomp, name='single_column', value=cvalue, isPresent=isPresent, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-    if (isPresent) then
-       read(cvalue,*) single_column
-    else
-       single_column = .false.
-    end if
-    if (single_column) then
-       ! Must have these attributes present
-       call NUOPC_CompAttributeGet(gcomp, name='scmlon', value=cvalue, rc=rc)
-       if (ChkErr(rc,__LINE__,u_FILE_u)) return
-       read(cvalue,*) scmlon
-       call NUOPC_CompAttributeGet(gcomp, name='scmlat', value=cvalue, rc=rc)
-       if (ChkErr(rc,__LINE__,u_FILE_u)) return
-       read(cvalue,*) scmlat
     end if
 
     ! Determine runid
@@ -425,37 +478,6 @@ contains
        read(cvalue,*) runid
     else
        runid = 'unknown'  ! read in from the namelist in ice_init.F90 if CESMCOUPLED is not defined
-    end if
-
-    ! Determine tfreeze_option, flux convertence before call to cice_init
-    call NUOPC_CompAttributeGet(gcomp, name="tfreeze_option", value=tfrz_option, isPresent=isPresent, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-    if (.not. isPresent) then
-       tfrz_option = 'linear_salt'  ! TODO: is this right? This must be the same as mom is using for the calculation.
-    end if
-
-    call NUOPC_CompAttributeGet(gcomp, name="flux_convergence", value=cvalue, isPresent=isPresent, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-    if (isPresent) then
-       read(cvalue,*) flux_convergence_tolerance
-    else
-       flux_convergence_tolerance = 0._r8
-    end if
-
-    call NUOPC_CompAttributeGet(gcomp, name="flux_max_iteration", value=cvalue, isPresent=isPresent, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-    if (isPresent) then
-       read(cvalue,*) flux_convergence_max_iteration
-    else
-       flux_convergence_max_iteration = 5
-    end if
-
-    call NUOPC_CompAttributeGet(gcomp, name="coldair_outbreak_mod", value=cvalue, isPresent=isPresent, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-    if (isPresent) then
-       read(cvalue,*) use_coldair_outbreak_mod
-    else
-       use_coldair_outbreak_mod = .false.
     end if
 
     ! Get clock information before call to cice_init
@@ -493,7 +515,7 @@ contains
     else if (esmf_caltype == ESMF_CALKIND_GREGORIAN) then
        calendar_type = shr_cal_gregorian
     else
-       call shr_sys_abort( subname//'ERROR:: bad calendar for ESMF' )
+       call abort_ice( subname//'ERROR:: bad calendar for ESMF' )
     end if
 
     !----------------------------------------------------------------------------
@@ -509,15 +531,104 @@ contains
     call shr_file_setLogUnit (shrlogunit)
 
     !----------------------------------------------------------------------------
-    ! Initialize cice
+    ! Initialize cice1
     !----------------------------------------------------------------------------
 
-    ! Note that cice_init also sets time manager info as well as mpi communicator info,
-    ! including master_task and my_task
+    call cice_init1()
 
-    call t_startf ('cice_init')
-    call cice_init
-    call t_stopf ('cice_init')
+    !----------------------------------------------------------------------------
+    ! Initialize grid info
+    !----------------------------------------------------------------------------
+
+    ! Initialize cice mesh and mask if appropriate
+
+    if (single_column .and. scol_valid) then
+       call ice_mesh_init_tlon_tlat_area_hm()
+    else
+       ! Determine mesh input file
+       call NUOPC_CompAttributeGet(gcomp, name='mesh_ice', value=ice_meshfile, rc=rc)
+       if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+       ! Determine mask input file
+       call NUOPC_CompAttributeGet(gcomp, name='mesh_mask', value=ice_maskfile, rc=rc)
+       if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+       if (my_task == master_task) then
+          write(nu_diag,*)'mesh file for cice domain is ',trim(ice_meshfile)
+          write(nu_diag,*)'mask file for cice domain is ',trim(ice_maskfile)
+       end if
+
+       ! Determine the model distgrid using the decomposition obtained in
+       ! call to init_grid1 called from cice_init1
+       call ice_mesh_set_distgrid(localpet, npes, ice_distgrid, rc)
+       if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+       ! Read in the ice mesh on the cice distribution
+       ice_mesh = ESMF_MeshCreate(filename=trim(ice_meshfile), fileformat=ESMF_FILEFORMAT_ESMFMESH, &
+            elementDistGrid=ice_distgrid, rc=rc)
+       if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+       ! Initialize the cice mesh and the cice mask
+       if (trim(grid_type) == 'setmask') then
+          ! In this case cap code determines the mask file
+          call ice_mesh_setmask_from_maskfile(ice_maskfile, ice_mesh, rc=rc)
+          if (ChkErr(rc,__LINE__,u_FILE_u)) return
+          call ice_mesh_init_tlon_tlat_area_hm()
+          if (ChkErr(rc,__LINE__,u_FILE_u)) return
+       else
+          ! In this case init_grid2 will initialize tlon, tlat, area and hm
+          call init_grid2()
+          call ice_mesh_check(ice_mesh, rc=rc)
+          if (ChkErr(rc,__LINE__,u_FILE_u)) return
+       end if
+    end if
+
+    !----------------------------------------------------------------------------
+    ! Initialize cice2
+    !----------------------------------------------------------------------------
+
+    ! Note that cice_init2 also sets time manager info as well as mpi communicator info,
+    ! including master_task and my_task
+    ! call t_startf ('cice_init2')
+    call cice_init2()
+    !call t_stopf ('cice_init2')
+
+    !----------------------------------------------------------------------------
+    ! Overwrite input namelists with data coming from the driver
+    !----------------------------------------------------------------------------
+    ! NOTE: The following calls must occur AFTER the ice is initialized since it will overwrite
+
+    ! the input namelists
+    ! Determine tfreeze_option, flux convertence before call to cice_init
+    call NUOPC_CompAttributeGet(gcomp, name="tfreeze_option", value=tfrz_option, isPresent=isPresent, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    if (.not. isPresent) then
+       tfrz_option = 'linear_salt'  ! TODO: is this right? This must be the same as mom is using for the calculation.
+    end if
+
+    call NUOPC_CompAttributeGet(gcomp, name="coldair_outbreak_mod", value=cvalue, isPresent=isPresent, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    if (isPresent) then
+       read(cvalue,*) use_coldair_outbreak_mod
+    else
+       use_coldair_outbreak_mod = .false.
+    end if
+
+    call NUOPC_CompAttributeGet(gcomp, name="flux_convergence", value=cvalue, isPresent=isPresent, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    if (isPresent) then
+       read(cvalue,*) flux_convergence_tolerance
+    else
+       flux_convergence_tolerance = 0._r8
+    end if
+
+    call NUOPC_CompAttributeGet(gcomp, name="flux_max_iteration", value=cvalue, isPresent=isPresent, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    if (isPresent) then
+       read(cvalue,*) flux_convergence_max_iteration
+    else
+       flux_convergence_max_iteration = 5
+    end if
 
     !----------------------------------------------------------------------------
     ! reset shr logging to my log file
@@ -570,7 +681,7 @@ contains
              write(nu_diag,*) trim(subname),' ERROR curr_ymd,year_init =',curr_ymd,year_init
              write(nu_diag,*) trim(subname),' ERROR idate lt zero',idate
           end if
-          call shr_sys_abort(subname//' :: ERROR idate lt zero')
+          call abort_ice(subname//' :: ERROR idate lt zero')
        endif
        iyear = (idate/10000)                     ! integer year of basedate
        month = (idate-iyear*10000)/100           ! integer month of basedate
@@ -596,218 +707,11 @@ contains
        call accum_hist(dt)  ! write initial conditions
     end if
 
-    !---------------------------------------------------------------------------
-    ! Determine the global index space needed for the distgrid
-    !---------------------------------------------------------------------------
-
-    ! number the local grid to get allocation size for gindex_ice
-    lsize = 0
-    do iblk = 1, nblocks
-       this_block = get_block(blocks_ice(iblk),iblk)
-       ilo = this_block%ilo
-       ihi = this_block%ihi
-       jlo = this_block%jlo
-       jhi = this_block%jhi
-       do j = jlo, jhi
-          do i = ilo, ihi
-             lsize = lsize + 1
-          enddo
-       enddo
-    enddo
-
-    ! set global index array
-    allocate(gindex_ice(lsize))
-    n = 0
-    do iblk = 1, nblocks
-       this_block = get_block(blocks_ice(iblk),iblk)
-       ilo = this_block%ilo
-       ihi = this_block%ihi
-       jlo = this_block%jlo
-       jhi = this_block%jhi
-       do j = jlo, jhi
-          do i = ilo, ihi
-             n = n+1
-             ig = this_block%i_glob(i)
-             jg = this_block%j_glob(j)
-             gindex_ice(n) = (jg-1)*nx_global + ig
-          enddo
-       enddo
-    enddo
-
-    ! Determine total number of eliminated blocks globally
-    globalID = 0
-    num_elim_global = 0  ! number of eliminated blocks
-    num_total_blocks = 0
-    do jblk=1,nblocks_y
-       do iblk=1,nblocks_x
-          globalID = globalID + 1
-          num_total_blocks = num_total_blocks + 1
-          if (distrb_info%blockLocation(globalID) == 0) then
-             num_elim_global = num_elim_global + 1
-          end if
-       end do
-    end do
-
-    if (num_elim_global > 0) then
-
-       ! Distribute the eliminated blocks in a round robin fashion amoung processors
-       num_elim_local = num_elim_global / npes
-       my_elim_start = num_elim_local*localPet + min(localPet, mod(num_elim_global, npes)) + 1
-       if (localPet < mod(num_elim_global, npes)) then
-          num_elim_local = num_elim_local + 1
-       end if
-       my_elim_end = my_elim_start + num_elim_local - 1
-
-       ! Determine the number of eliminated gridcells locally
-       globalID = 0
-       num_elim_blocks = 0  ! local number of eliminated blocks
-       num_elim_gcells = 0
-       do jblk=1,nblocks_y
-          do iblk=1,nblocks_x
-             globalID = globalID + 1
-             if (distrb_info%blockLocation(globalID) == 0) then
-                num_elim_blocks = num_elim_blocks + 1
-                if (num_elim_blocks >= my_elim_start .and. num_elim_blocks <= my_elim_end) then
-                   this_block = get_block(globalID, globalID)
-                   num_elim_gcells = num_elim_gcells + &
-                        (this_block%jhi-this_block%jlo+1) * (this_block%ihi-this_block%ilo+1)
-                end if
-             end if
-          end do
-       end do
-
-       ! Determine the global index space of the eliminated gridcells
-       allocate(gindex_elim(num_elim_gcells))
-       globalID = 0
-       num_elim_gcells = 0  ! local number of eliminated gridcells
-       num_elim_blocks = 0  ! local number of eliminated blocks
-       do jblk=1,nblocks_y
-          do iblk=1,nblocks_x
-             globalID = globalID + 1
-             if (distrb_info%blockLocation(globalID) == 0) then
-                this_block = get_block(globalID, globalID)
-                num_elim_blocks = num_elim_blocks + 1
-                if (num_elim_blocks >= my_elim_start .and. num_elim_blocks <= my_elim_end) then
-                   do j=this_block%jlo,this_block%jhi
-                      do i=this_block%ilo,this_block%ihi
-                         num_elim_gcells = num_elim_gcells + 1
-                         ig = this_block%i_glob(i)
-                         jg = this_block%j_glob(j)
-                         gindex_elim(num_elim_gcells) = (jg-1)*nx_global + ig
-                      end do
-                   end do
-                end if
-             end if
-          end do
-       end do
-
-       ! create a global index that includes both active and eliminated gridcells
-       num_ice  = size(gindex_ice)
-       num_elim = size(gindex_elim)
-       allocate(gindex(num_elim + num_ice))
-       do n = 1,num_ice
-          gindex(n) = gindex_ice(n)
-       end do
-       do n = num_ice+1,num_ice+num_elim
-          gindex(n) = gindex_elim(n-num_ice)
-       end do
-
-       deallocate(gindex_elim)
-
-    else
-
-       ! No eliminated land blocks
-       num_ice = size(gindex_ice)
-       allocate(gindex(num_ice))
-       do n = 1,num_ice
-          gindex(n) = gindex_ice(n)
-       end do
-
-    end if
-
-    !---------------------------------------------------------------------------
-    ! Create distGrid from global index array
-    !---------------------------------------------------------------------------
-
-    DistGrid = ESMF_DistGridCreate(arbSeqIndexList=gindex, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-
-    !---------------------------------------------------------------------------
-    ! Create the CICE mesh
-    !---------------------------------------------------------------------------
-
-    ! read in the mesh
-    call NUOPC_CompAttributeGet(gcomp, name='mesh_ice', value=cvalue, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-
-    MeshTemp = ESMF_MeshCreate(filename=trim(cvalue), fileformat=ESMF_FILEFORMAT_ESMFMESH, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-    if (my_task == master_task) then
-       write(nu_diag,*)'mesh file for cice domain is ',trim(cvalue)
-    end if
-
-    ! recreate the mesh using the above distGrid
-    Mesh = ESMF_MeshCreate(MeshTemp, elementDistgrid=Distgrid, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-
-    ! obtain mesh lats and lons
-    call ESMF_MeshGet(mesh, spatialDim=spatialDim, numOwnedElements=numOwnedElements, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-    allocate(ownedElemCoords(spatialDim*numOwnedElements))
-    allocate(lonMesh(numOwnedElements), latMesh(numOwnedElements))
-    call ESMF_MeshGet(mesh, ownedElemCoords=ownedElemCoords)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-
-    do n = 1,numOwnedElements
-       lonMesh(n) = ownedElemCoords(2*n-1)
-       latMesh(n) = ownedElemCoords(2*n)
-    end do
-
-    ! obtain internally generated cice lats and lons for error checks
-    allocate(lon(lsize))
-    allocate(lat(lsize))
-    n = 0
-    do iblk = 1, nblocks
-       this_block = get_block(blocks_ice(iblk),iblk)
-       ilo = this_block%ilo
-       ihi = this_block%ihi
-       jlo = this_block%jlo
-       jhi = this_block%jhi
-       do j = jlo, jhi
-          do i = ilo, ihi
-             n = n+1
-             lon(n) = tlon(i,j,iblk)*rad_to_deg
-             lat(n) = tlat(i,j,iblk)*rad_to_deg
-          enddo
-       enddo
-    enddo
-
-    ! error check differences between internally generated lons and those read in
-    do n = 1,lsize
-       diff_lon = abs(lonMesh(n) - lon(n))
-       if ( (diff_lon > 1.e2  .and. abs(diff_lon - 360_r8) > 1.e-1) .or.&
-            (diff_lon > 1.e-3 .and. diff_lon < 1._r8) ) then
-          !write(6,100)n,lonMesh(n),lon(n), diff_lon
-100       format('ERROR: CICE  n, lonmesh(n), lon(n), diff_lon = ',i6,2(f21.13,3x),d21.5)
-          !call shr_sys_abort()
-       end if
-       if (abs(latMesh(n) - lat(n)) > 1.e-1) then
-          !write(6,101)n,latMesh(n),lat(n), abs(latMesh(n)-lat(n))
-101       format('ERROR: CICE n, latmesh(n), lat(n), diff_lat = ',i6,2(f21.13,3x),d21.5)
-          !call shr_sys_abort()
-       end if
-    end do
-
-    ! deallocate memory
-    deallocate(ownedElemCoords)
-    deallocate(lon, lonMesh)
-    deallocate(lat, latMesh)
-
     !-----------------------------------------------------------------
     ! Realize the actively coupled fields
     !-----------------------------------------------------------------
 
-    call ice_realize_fields(gcomp, mesh=mesh, &
+    call ice_realize_fields(importState, exportState, mesh=ice_mesh, &
          flds_scalar_name=flds_scalar_name, flds_scalar_num=flds_scalar_num, rc=rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
@@ -815,7 +719,7 @@ contains
     ! Prescribed ice initialization
     !-----------------------------------------------------------------
 
-    call ice_prescribed_init(clock, mesh, rc)
+    call ice_prescribed_init(clock, ice_mesh, rc)
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
     !-----------------------------------------------------------------
@@ -834,11 +738,6 @@ contains
 
     ! TODO (mvertens, 2018-12-21): fill in iceberg_prognostic as .false.
 
-    if (debug_export > 0 .and. my_task==master_task) then
-       call State_fldDebug(exportState, flds_scalar_name, 'cice_export:', &
-            idate, sec, nu_diag, rc=rc)
-    end if
-
     !--------------------------------
     ! diagnostics
     !--------------------------------
@@ -851,9 +750,6 @@ contains
     if (dbug > 5) call ESMF_LogWrite(subname//' done', ESMF_LOGMSG_INFO)
 
     call t_stopf ('cice_init_total')
-
-    deallocate(gindex_ice)
-    deallocate(gindex)
 
   end subroutine InitializeRealize
 
@@ -870,33 +766,41 @@ contains
     integer, intent(out) :: rc
 
     ! Local variables
-    type(ESMF_Clock)           :: clock
-    type(ESMF_Alarm)           :: alarm
-    type(ESMF_Time)            :: currTime
-    type(ESMF_Time)            :: nextTime
-    type(ESMF_State)           :: importState, exportState
-    character(ESMF_MAXSTR)     :: cvalue
-    integer                    :: shrlogunit ! original log unit
-    integer                    :: k,n        ! index
-    logical                    :: stop_now   ! .true. ==> stop at the end of this run phase
-    integer                    :: ymd        ! Current date (YYYYMMDD)
-    integer                    :: tod        ! Current time of day (sec)
-    integer                    :: curr_ymd   ! Current date (YYYYMMDD)
-    integer                    :: curr_tod   ! Current time of day (s)
-    integer                    :: yy,mm,dd   ! year, month, day, time of day
-    integer                    :: ymd_sync   ! Sync date (YYYYMMDD)
-    integer                    :: yr_sync    ! Sync current year
-    integer                    :: mon_sync   ! Sync current month
-    integer                    :: day_sync   ! Sync current day
-    integer                    :: tod_sync   ! Sync current time of day (sec)
-    character(CL)              :: restart_date
-    character(CL)              :: restart_filename
+    type(ESMF_Clock)       :: clock
+    type(ESMF_Alarm)       :: alarm
+    type(ESMF_Time)        :: currTime
+    type(ESMF_Time)        :: nextTime
+    type(ESMF_State)       :: importState, exportState
+    character(CL)          :: cvalue
+    integer                :: shrlogunit ! original log unit
+    integer                :: k,n        ! index
+    logical                :: stop_now   ! .true. ==> stop at the end of this run phase
+    integer                :: ymd        ! Current date (YYYYMMDD)
+    integer                :: tod        ! Current time of day (sec)
+    integer                :: curr_ymd   ! Current date (YYYYMMDD)
+    integer                :: curr_tod   ! Current time of day (s)
+    integer                :: yy,mm,dd   ! year, month, day, time of day
+    integer                :: ymd_sync   ! Sync date (YYYYMMDD)
+    integer                :: yr_sync    ! Sync current year
+    integer                :: mon_sync   ! Sync current month
+    integer                :: day_sync   ! Sync current day
+    integer                :: tod_sync   ! Sync current time of day (sec)
+    character(CL)          :: restart_date
+    character(CL)          :: restart_filename
     character(*)   , parameter :: F00   = "('(ice_comp_nuopc) ',2a,i8,d21.14)"
-    character(len=*),parameter  :: subname=trim(modName)//':(ModelAdvance) '
+    character(len=*),parameter :: subname=trim(modName)//':(ModelAdvance) '
     !--------------------------------
 
     rc = ESMF_SUCCESS
     if (dbug > 5) call ESMF_LogWrite(subname//' called', ESMF_LOGMSG_INFO)
+
+    !--------------------------------
+    ! Single column logic if nearest neighbor point has a mask of zero
+    !--------------------------------
+
+    if (single_column .and. .not. scol_valid) then
+       RETURN
+    end if
 
     !--------------------------------
     ! Turn on timers
@@ -905,6 +809,7 @@ contains
     call ice_timer_start(timer_total) ! time entire run
     call t_barrierf('cice_run_total_BARRIER',mpi_comm_ice)
     call t_startf ('cice_run_total')
+!$  call omp_set_num_threads(nthrds)
 
     !--------------------------------
     ! Reset shr logging to my log file
@@ -1006,13 +911,6 @@ contains
     call ice_timer_stop(timer_cplrecv)
     call t_stopf ('cice_run_import')
 
-    ! write Debug output
-    if (debug_import  > 0 .and. my_task==master_task) then
-       call State_fldDebug(importState, flds_scalar_name, 'cice_import:', &
-            idate, sec, nu_diag, rc=rc)
-       if (ChkErr(rc,__LINE__,u_FILE_u)) return
-    end if
-
     !--------------------------------
     ! Advance cice and timestep update
     !--------------------------------
@@ -1036,12 +934,6 @@ contains
 
     call ice_timer_stop(timer_cplsend)
     call t_stopf ('cice_run_export')
-
-    if (debug_export > 0 .and. my_task==master_task) then
-       call State_fldDebug(exportState, flds_scalar_name, 'cice_export:', &
-            idate, sec, nu_diag, rc=rc)
-       if (ChkErr(rc,__LINE__,u_FILE_u)) return
-    end if
 
     ! reset shr logging to my original values
     call shr_file_setLogUnit (shrlogunit)
@@ -1248,7 +1140,7 @@ contains
     ! input/output variables
     type(ESMF_GridComp)                 :: gcomp
     integer             , intent(in)    :: logunit
-    logical             , intent(in)    :: mastertask 
+    logical             , intent(in)    :: mastertask
     integer             , intent(out)   :: rc              ! output error
 
     ! local variables
@@ -1342,12 +1234,12 @@ contains
   subroutine cice_orbital_update(clock, logunit,  mastertask, eccen, obliqr, lambm0, mvelpp, rc)
 
     !----------------------------------------------------------
-    ! Update orbital settings 
+    ! Update orbital settings
     !----------------------------------------------------------
 
     ! input/output variables
     type(ESMF_Clock) , intent(in)    :: clock
-    integer          , intent(in)    :: logunit 
+    integer          , intent(in)    :: logunit
     logical          , intent(in)    :: mastertask
     real(R8)         , intent(inout) :: eccen  ! orbital eccentricity
     real(R8)         , intent(inout) :: obliqr ! Earths obliquity in rad
@@ -1357,7 +1249,7 @@ contains
 
     ! local variables
     type(ESMF_Time)   :: CurrTime ! current time
-    integer           :: year     ! model year at current time 
+    integer           :: year     ! model year at current time
     integer           :: orb_year ! orbital year for current orbital computation
     character(len=CL) :: msgstr   ! temporary
     logical           :: lprint
@@ -1373,7 +1265,7 @@ contains
        orb_year = orb_iyear + (year - orb_iyear_align)
        lprint = mastertask
     else
-       orb_year = orb_iyear 
+       orb_year = orb_iyear
        if (first_time) then
           lprint = mastertask
           first_time = .false.
